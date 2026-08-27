@@ -30,6 +30,8 @@ options:
       --inventory           File to store (or read from) all indexed filepaths (default sccmfiles.txt)
       --download <outdir>   Downloads all the files referenced by the inventory file to the <outdir>
       --single-file <path>  Download a single file with a specified path to the DataLib formatted as in the inventory file
+      --hunt                Search FileLib for blobs referenced by inaccessible DataLib entries
+      --noaccess-file       File containing inaccessible DataLib entries (default: derived from --inventory)
       --relay               Start an SMB listener that will relay incoming
                             NTLM authentications to the remote server and
                             use that connection. NOTE that this forces SMB 2.1
@@ -79,3 +81,29 @@ Make sure to properly quote or escape the double backslash
 ```
 ./go-cmloot --host server001 --user testuser --pass secretPass123 -d test.local --single-file '\\sccm\SCCMContentLib$\DataLib\SC10008D.1\Manifest.xml' --download loot
 ```
+
+### Hunt content protected only by DataLib ACLs
+
+When inventory cannot enumerate a DataLib entry, go-cmloot records its name in
+`<inventory>_noaccess<extension>`. For the default inventory, the companion
+file is `sccmfiles_noaccess.txt`.
+
+If the same account can still read FileLib metadata and content blobs, Hunt
+matches that no-access list against FileLib metadata and downloads matching
+blobs. Results are written to `CMLootOut` by default, with a
+`hunt-manifest.tsv` that maps each blob to the matching DataLib reference.
+
+```
+./go-cmloot --host server001 --user testuser --pass secretPass123 -d test.local
+./go-cmloot --host server001 --user testuser --pass secretPass123 -d test.local --hunt
+```
+
+Use a different inventory or no-access file when needed:
+
+```
+./go-cmloot --host server001 --user testuser --pass secretPass123 -d test.local \
+  --hunt --noaccess-file restricted.txt --download loot
+```
+
+Hunt does not bypass FileLib permissions. It only succeeds when the target's
+FileLib metadata and referenced blobs remain readable.

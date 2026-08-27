@@ -17,21 +17,21 @@ func TestNoAccessFilename(t *testing.T) {
 }
 
 func TestMatchingReference(t *testing.T) {
-	metadata := []byte("[File]\r\n secret.ps1.INI = 2\r\nother.xml.INI=1\r\n")
-	entries := map[string]struct{}{"secret.ps1.ini": {}}
+	metadata := []byte("[User]\r\n P0100001.1 =\r\nP0100002.1=\r\n")
+	entries := map[string]struct{}{"p0100001.1": {}}
 
 	got, ok := matchingReference(metadata, entries)
 	if !ok {
 		t.Fatal("matchingReference did not find a reference")
 	}
-	if got != "secret.ps1.INI" {
-		t.Errorf("matchingReference() = %q, want %q", got, "secret.ps1.INI")
+	if got != "P0100001.1" {
+		t.Errorf("matchingReference() = %q, want %q", got, "P0100001.1")
 	}
 }
 
 func TestMatchingReferenceIgnoresNonMatchingMetadata(t *testing.T) {
-	metadata := []byte("[File]\nother.xml.INI=1\n")
-	entries := map[string]struct{}{"secret.ps1.ini": {}}
+	metadata := []byte("[User]\nP0100002.1=\n")
+	entries := map[string]struct{}{"p0100001.1": {}}
 
 	if got, ok := matchingReference(metadata, entries); ok || got != "" {
 		t.Errorf("matchingReference() = %q, %t; want no match", got, ok)

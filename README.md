@@ -84,9 +84,9 @@ Make sure to properly quote or escape the double backslash
 
 ### Hunt content protected only by DataLib ACLs
 
-When inventory cannot enumerate a DataLib entry, go-cmloot records its name in
-`<inventory>_noaccess<extension>`. For the default inventory, the companion
-file is `sccmfiles_noaccess.txt`.
+When inventory cannot enumerate a DataLib package directory, go-cmloot records
+its identifier in `<inventory>_noaccess<extension>`. For the default
+inventory, the companion file is `sccmfiles_noaccess.txt`.
 
 If the same account can still read FileLib metadata and content blobs, Hunt
 matches that no-access list against FileLib metadata and downloads matching
